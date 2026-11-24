@@ -235,44 +235,44 @@ fn lex(src: &str) -> Vec<Token<'_>> {
 }
 
 /// The first byte index from `from` where `s` holds `what` outside a backslash
-/// escape, or None (markdown.js findUnescaped).
+/// escape, or None (markdown.js findUnescaped). Byte-based: `what` is ASCII,
+/// so it can only match at a character boundary, and an escapable character
+/// after a backslash is ASCII too.
 fn find_unescaped(s: &str, what: &str, from: usize) -> Option<usize> {
     let b = s.as_bytes();
+    let w = what.as_bytes();
     let mut j = from;
-    while j + what.len() <= s.len() {
-        if b[j] == b'\\' {
-            if let Some(n) = s[j + 1..].chars().next() {
-                if is_escapable(n) {
-                    j += 1 + n.len_utf8();
-                    continue;
-                }
+    while j + w.len() <= s.len() {
+        if b[j] == b'\\' && j + 1 < s.len() {
+            let n = b[j + 1];
+            if n < 0x80 && is_escapable(n as char) {
+                j += 2;
+                continue;
             }
         }
-        if s[j..].starts_with(what) {
+        if &b[j..j + w.len()] == w {
             return Some(j);
         }
-        j += s[j..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        j += 1;
     }
     None
 }
 
 /// The first single `*` from `from` (one whose run is not `**`), outside an
-/// escape, or None (markdown.js findSingleStar).
+/// escape, or None (markdown.js findSingleStar). Byte-based, as above.
 fn find_single_star(s: &str, from: usize) -> Option<usize> {
     let b = s.as_bytes();
     let mut j = from;
     while j < s.len() {
-        let c = b[j];
-        if c == b'\\' {
-            if let Some(n) = s[j + 1..].chars().next() {
-                if is_escapable(n) {
-                    j += 1 + n.len_utf8();
-                    continue;
-                }
+        if b[j] == b'\\' && j + 1 < s.len() {
+            let n = b[j + 1];
+            if n < 0x80 && is_escapable(n as char) {
+                j += 2;
+                continue;
             }
         }
-        if c != b'*' {
-            j += s[j..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        if b[j] != b'*' {
+            j += 1;
             continue;
         }
         if j + 1 < s.len() && b[j + 1] == b'*' {
@@ -289,12 +289,31 @@ pub trait Linker {
     fn link(&mut self, target: &str) -> String;
 }
 
-/// `s` rendered inline; `env.link(target)` is a link's href.
-pub fn inline(s: &str, env: &mut dyn Linker) -> String {
-    let mut out = String::with_capacity(s.len());
+/// `s` rendered inline into `out`; `env.link(target)` is a link's href.
+/// Writing into the caller's buffer (instead of returning a fresh string
+/// per emphasis/link segment) keeps inline rendering allocation-free apart
+/// from the page's own buffer.
+pub fn inline_into(s: &str, env: &mut dyn Linker, out: &mut String) {
     let b = s.as_bytes();
     let mut i = 0;
     while i < s.len() {
+        // A run of plain bytes — ASCII, none of \ ` * [ & < > " ' — is copied
+        // at once; the special bytes are all ASCII, so a run never splits a
+        // multi-byte character.
+        let mut j = i;
+        while j < b.len() {
+            match b[j] {
+                b'\\' | b'`' | b'*' | b'[' | b'&' | b'<' | b'>' | b'"' | b'\'' => break,
+                _ => j += 1,
+            }
+        }
+        if j > i {
+            out.push_str(&s[i..j]);
+            i = j;
+            if i >= s.len() {
+                break;
+            }
+        }
         let ch = s[i..].chars().next().unwrap();
         let clen = ch.len_utf8();
         if ch == '\\' {
@@ -324,7 +343,7 @@ pub fn inline(s: &str, env: &mut dyn Linker) -> String {
             if let Some(j) = found {
                 if j > i + 1 {
                     out.push_str("<code>");
-                    push_escaped(&mut out, &s[i + 1..j]);
+                    push_escaped(out, &s[i + 1..j]);
                     out.push_str("</code>");
                     i = j + 1;
                     continue;
@@ -339,7 +358,7 @@ pub fn inline(s: &str, env: &mut dyn Linker) -> String {
                 if let Some(j) = find_unescaped(s, "**", i + 2) {
                     if j > i + 2 {
                         out.push_str("<strong>");
-                        out.push_str(&inline(&s[i + 2..j], env));
+                        inline_into(&s[i + 2..j], env, out);
                         out.push_str("</strong>");
                         i = j + 2;
                         continue;
@@ -352,7 +371,7 @@ pub fn inline(s: &str, env: &mut dyn Linker) -> String {
             if let Some(j) = find_single_star(s, i + 1) {
                 if j > i + 1 {
                     out.push_str("<em>");
-                    out.push_str(&inline(&s[i + 1..j], env));
+                    inline_into(&s[i + 1..j], env, out);
                     out.push_str("</em>");
                     i = j + 1;
                     continue;
@@ -386,9 +405,9 @@ pub fn inline(s: &str, env: &mut dyn Linker) -> String {
             if !target.is_empty() && !target.chars().any(is_js_ws) {
                 let href = env.link(target);
                 out.push_str("<a href=\"");
-                push_escaped(&mut out, &href);
+                push_escaped(out, &href);
                 out.push_str("\">");
-                out.push_str(&inline(&s[i + 1..k.unwrap()], env));
+                inline_into(&s[i + 1..k.unwrap()], env, out);
                 out.push_str("</a>");
                 i = m.unwrap() + 1;
                 continue;
@@ -405,7 +424,6 @@ pub fn inline(s: &str, env: &mut dyn Linker) -> String {
         }
         i += clen;
     }
-    out
 }
 
 pub struct TocEntry {
@@ -425,75 +443,73 @@ pub struct Rendered {
 /// (the first paragraph's inline HTML, or "").
 pub fn render_markdown(src: &str, env: &mut dyn Linker) -> Rendered {
     let mut ids: BTreeSet<String> = BTreeSet::new();
-    let mut blocks: Vec<String> = Vec::new();
+    // Blocks are appended straight into one buffer instead of collected and
+    // joined (one fewer full copy of every page's HTML).
+    let mut html = String::new();
     let mut toc: Vec<TocEntry> = Vec::new();
     let mut excerpt: Option<String> = None;
     for t in lex(src) {
         match t {
             Token::Heading { depth, text } => {
                 let id = unique_slug(&slugify(text), &mut ids);
-                let html = inline(text, env);
-                blocks.push(format!("<h{depth} id=\"{id}\">{html}</h{depth}>"));
+                let mut inner = String::new();
+                inline_into(text, env, &mut inner);
+                html.push_str(&format!("<h{depth} id=\"{id}\">{inner}</h{depth}>\n"));
                 if depth == 2 || depth == 3 {
-                    toc.push(TocEntry { level: depth, id, html });
+                    toc.push(TocEntry { level: depth, id, html: inner });
                 }
             }
             Token::Code { lang, lines } => {
-                let cls = if lang.is_empty() {
-                    String::new()
-                } else {
-                    let mut c = String::from(" class=\"language-");
-                    push_escaped(&mut c, lang);
-                    c.push('"');
-                    c
-                };
-                let mut body = String::new();
-                for l in lines {
-                    push_escaped(&mut body, l);
-                    body.push('\n');
+                html.push_str("<pre><code");
+                if !lang.is_empty() {
+                    html.push_str(" class=\"language-");
+                    push_escaped(&mut html, lang);
+                    html.push('"');
                 }
-                blocks.push(format!("<pre><code{cls}>{body}</code></pre>"));
+                html.push('>');
+                for l in lines {
+                    push_escaped(&mut html, l);
+                    html.push('\n');
+                }
+                html.push_str("</code></pre>\n");
             }
-            Token::Hr => blocks.push("<hr>".to_string()),
+            Token::Hr => html.push_str("<hr>\n"),
             Token::Blockquote { lines } => {
                 if lines.is_empty() {
-                    blocks.push("<blockquote>\n</blockquote>".to_string());
+                    html.push_str("<blockquote>\n</blockquote>\n");
                 } else {
-                    let inner = inline(&lines.join("\n"), env);
-                    blocks.push(format!("<blockquote>\n<p>{inner}</p>\n</blockquote>"));
+                    html.push_str("<blockquote>\n<p>");
+                    inline_into(&lines.join("\n"), env, &mut html);
+                    html.push_str("</p>\n</blockquote>\n");
                 }
             }
             Token::List { ordered, start, items } => {
                 let tag = if ordered { "ol" } else { "ul" };
-                let open = if ordered && start != 1 {
-                    format!("<ol start=\"{start}\">")
+                if ordered && start != 1 {
+                    html.push_str(&format!("<ol start=\"{start}\">\n"));
                 } else {
-                    format!("<{tag}>")
-                };
-                let mut block = String::new();
-                block.push_str(&open);
-                block.push('\n');
-                for item in &items {
-                    block.push_str("<li>");
-                    block.push_str(&inline(item, env));
-                    block.push_str("</li>\n");
+                    html.push_str(&format!("<{tag}>\n"));
                 }
-                block.push_str(&format!("</{tag}>"));
-                blocks.push(block);
+                for item in &items {
+                    html.push_str("<li>");
+                    inline_into(item, env, &mut html);
+                    html.push_str("</li>\n");
+                }
+                html.push_str(&format!("</{tag}>\n"));
             }
             Token::Paragraph { text } => {
-                let html = inline(&text, env);
+                html.push_str("<p>");
+                // The excerpt is this paragraph's inline HTML; slice it out
+                // of the page buffer instead of rendering it twice.
+                let inner_start = html.len();
+                inline_into(&text, env, &mut html);
+                let inner_end = html.len();
+                html.push_str("</p>\n");
                 if excerpt.is_none() {
-                    excerpt = Some(html.clone());
+                    excerpt = Some(html[inner_start..inner_end].to_string());
                 }
-                blocks.push(format!("<p>{html}</p>"));
             }
         }
-    }
-    let mut html = String::new();
-    for b in blocks {
-        html.push_str(&b);
-        html.push('\n');
     }
     Rendered { html, toc, excerpt: excerpt.unwrap_or_default() }
 }

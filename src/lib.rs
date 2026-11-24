@@ -19,7 +19,8 @@ use markdown::{render_markdown, Linker, TocEntry};
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use template::{parse_template, render_nodes, Ctx, Scope, Val};
+use std::rc::Rc;
+use template::{analyze_templates, parse_template, render_nodes, Ctx, Scope, Val};
 use util::{
     cmp_u16, dir_of, js_to_integer, long_date, resolve_path, sanitize_lone_surrogates, slugify,
     unique_slug, words_of,
@@ -67,18 +68,30 @@ struct FileIn {
 struct Source {
     path: String,
     data: FmData,
-    body: String,
+    /// The whole file text (line ends made "\n"); the body is the slice
+    /// after the front matter, so no copy of it is made.
+    content: String,
+    body_from: usize,
     post: bool,
     layout: String,
     slug: String,
     out_dir: String,
     url: String,
-    html: String,
+    /// The rendered Markdown HTML, shared with the page value by reference
+    /// (an `Rc` clone) instead of copied once per render.
+    html: Rc<str>,
     toc: Vec<TocEntry>,
     excerpt: String,
     tag_refs: Vec<TagRef>,
     newer: Option<usize>,
     older: Option<usize>,
+}
+
+impl Source {
+    /// The body: the file text after its front matter.
+    fn body(&self) -> &str {
+        &self.content[self.body_from..]
+    }
 }
 
 #[derive(Clone)]
@@ -153,15 +166,15 @@ impl Linker for MdLinker<'_> {
 /// A post's card, as lists show it (index.js cardOf).
 fn card_fields(s: &Source) -> Vec<(String, Val)> {
     vec![
-        ("title".to_string(), Val::Str(s.data.title.clone())),
-        ("url".to_string(), Val::Str(s.url.clone())),
+        ("title".to_string(), Val::str(s.data.title.clone())),
+        ("url".to_string(), Val::str(s.url.clone())),
         (
             "date".to_string(),
-            Val::Str(s.data.date.clone().unwrap_or_default()),
+            Val::str(s.data.date.clone().unwrap_or_default()),
         ),
         (
             "date_long".to_string(),
-            Val::Str(
+            Val::str(
                 s.data
                     .date
                     .as_ref()
@@ -171,23 +184,23 @@ fn card_fields(s: &Source) -> Vec<(String, Val)> {
         ),
         (
             "summary".to_string(),
-            Val::Str(s.data.summary.clone().unwrap_or_default()),
+            Val::str(s.data.summary.clone().unwrap_or_default()),
         ),
-        ("excerpt".to_string(), Val::Str(s.excerpt.clone())),
+        ("excerpt".to_string(), Val::str(s.excerpt.clone())),
         (
             "reading_minutes".to_string(),
-            Val::Num(((words_of(&s.body) as f64 / 200.0).ceil() as i64).max(1)),
+            Val::Num(((words_of(s.body()) as f64 / 200.0).ceil() as i64).max(1)),
         ),
         (
             "tags".to_string(),
-            Val::Arr(
+            Val::arr(
                 s.tag_refs
                     .iter()
                     .map(|t| {
-                        Val::Obj(vec![
-                            ("name".to_string(), Val::Str(t.name.clone())),
-                            ("slug".to_string(), Val::Str(t.slug.clone())),
-                            ("url".to_string(), Val::Str(t.url.clone())),
+                        Val::obj(vec![
+                            ("name".to_string(), Val::str(t.name.clone())),
+                            ("slug".to_string(), Val::str(t.slug.clone())),
+                            ("url".to_string(), Val::str(t.url.clone())),
                         ])
                     })
                     .collect(),
@@ -199,16 +212,16 @@ fn card_fields(s: &Source) -> Vec<(String, Val)> {
 fn link_val(s: Option<&Source>) -> Val {
     match s {
         None => Val::Null,
-        Some(s) => Val::Obj(vec![
-            ("title".to_string(), Val::Str(s.data.title.clone())),
-            ("url".to_string(), Val::Str(s.url.clone())),
+        Some(s) => Val::obj(vec![
+            ("title".to_string(), Val::str(s.data.title.clone())),
+            ("url".to_string(), Val::str(s.url.clone())),
             (
                 "date".to_string(),
-                Val::Str(s.data.date.clone().unwrap_or_default()),
+                Val::str(s.data.date.clone().unwrap_or_default()),
             ),
             (
                 "date_long".to_string(),
-                Val::Str(
+                Val::str(
                     s.data
                         .date
                         .as_ref()
@@ -223,18 +236,18 @@ fn link_val(s: Option<&Source>) -> Val {
 /// A page as its layout reads it (index.js pageOf).
 fn page_val(s: &Source, sources: &[Source]) -> Val {
     let mut fields = card_fields(s);
-    fields.push(("slug".to_string(), Val::Str(s.slug.clone())));
+    fields.push(("slug".to_string(), Val::str(s.slug.clone())));
     fields.push(("content".to_string(), Val::Str(s.html.clone())));
     fields.push((
         "toc".to_string(),
-        Val::Arr(
+        Val::arr(
             s.toc
                 .iter()
                 .map(|h| {
-                    Val::Obj(vec![
+                    Val::obj(vec![
                         ("level".to_string(), Val::Num(h.level as i64)),
-                        ("id".to_string(), Val::Str(h.id.clone())),
-                        ("html".to_string(), Val::Str(h.html.clone())),
+                        ("id".to_string(), Val::str(h.id.clone())),
+                        ("html".to_string(), Val::str(h.html.clone())),
                     ])
                 })
                 .collect(),
@@ -249,7 +262,7 @@ fn page_val(s: &Source, sources: &[Source]) -> Val {
         link_val(s.older.map(|i| &sources[i])),
     ));
     fields.push(("is_post".to_string(), Val::Bool(s.post)));
-    Val::Obj(fields)
+    Val::obj(fields)
 }
 
 fn render_named(
@@ -258,57 +271,70 @@ fn render_named(
     tags: &Val,
     recent: &Val,
     name: &str,
-    extra: Vec<(String, Val)>,
+    extra: Vec<(&str, Val)>,
+    depth: usize,
 ) -> Option<String> {
     let nodes = ctx.templates.get(name)?;
     let mut vars = vec![
-        ("site".to_string(), site.clone()),
-        ("tags".to_string(), tags.clone()),
-        ("recent".to_string(), recent.clone()),
+        ("site", site.clone()),
+        ("tags", tags.clone()),
+        ("recent", recent.clone()),
     ];
     vars.extend(extra);
-    let scope = Scope::root(vars);
+    let scope = Scope::root(&vars);
     let mut out = String::new();
-    render_nodes(nodes, &scope, ctx, 0, &mut out);
+    render_nodes(nodes, &scope, ctx, depth, &mut out);
     Some(out)
 }
 
-/// One site's output tree: path -> text (index.js build).
-fn build(input: &SiteInput) -> BTreeMap<String, String> {
+/// One site's output tree: path -> text (index.js build). Takes the input
+/// by value so file contents and template sources move instead of cloning.
+fn build(input: SiteInput) -> BTreeMap<String, String> {
+    let SiteInput { site, templates, files } = input;
     // Templates: parsed in code-unit order of name. One that does not parse
     // is reported and left out.
-    let mut ctx = Ctx { templates: BTreeMap::new() };
+    let mut ctx = Ctx { templates: BTreeMap::new(), constant: BTreeMap::new() };
     let mut report: Vec<String> = Vec::new();
-    let mut names: Vec<&String> = input.templates.keys().collect();
-    names.sort_by(|a, b| cmp_u16(a, b));
-    for name in names {
-        match parse_template(name, &input.templates[name]) {
+    let mut templates: Vec<(String, String)> = templates.into_iter().collect();
+    templates.sort_by(|a, b| cmp_u16(&a.0, &b.0));
+    for (name, src) in &templates {
+        match parse_template(name, src) {
             Ok(nodes) => {
                 ctx.templates.insert(name.clone(), nodes);
             }
             Err(msg) => report.push(msg),
         }
     }
-    let base = input.site.base_url.trim_end_matches('/').to_string();
+    let mut base = site.base_url;
+    while base.ends_with('/') {
+        base.pop();
+    }
 
     // Sources: in code-unit order of path, line ends made "\n".
-    let mut sorted_files: Vec<&FileIn> = input.files.iter().collect();
+    let mut sorted_files: Vec<FileIn> = files;
     sorted_files.sort_by(|a, b| cmp_u16(&a.path, &b.path));
     let mut sources: Vec<Source> = Vec::new();
-    let mut statics: Vec<&FileIn> = Vec::new();
+    let mut statics: Vec<FileIn> = Vec::new();
     for f in sorted_files {
         if f.path.ends_with(".md") {
-            let text = f.content.replace("\r\n", "\n").replace('\r', "\n");
+            // The line-end normalisation is a no-op copy unless the file
+            // actually holds a carriage return; move the content otherwise.
+            let text = if f.content.contains('\r') {
+                f.content.replace("\r\n", "\n").replace('\r', "\n")
+            } else {
+                f.content
+            };
             sources.push(Source {
-                path: f.path.clone(),
+                path: f.path,
                 data: FmData::default(),
-                body: text,
+                content: text,
+                body_from: 0,
                 post: false,
                 layout: String::new(),
                 slug: String::new(),
                 out_dir: String::new(),
                 url: String::new(),
-                html: String::new(),
+                html: Rc::from(""),
                 toc: Vec::new(),
                 excerpt: String::new(),
                 tag_refs: Vec::new(),
@@ -324,8 +350,8 @@ fn build(input: &SiteInput) -> BTreeMap<String, String> {
     // post with no date, layout missing, draft.
     let mut kept: Vec<Source> = Vec::new();
     for mut s in sources {
-        let fm = parse_front_matter(&s.body);
-        let (data, body) = match fm {
+        let fm = parse_front_matter(&s.content);
+        let (data, body_from) = match fm {
             Ok(v) => v,
             Err(e) => {
                 report.push(format!("refused {}: {e}", s.path));
@@ -333,7 +359,7 @@ fn build(input: &SiteInput) -> BTreeMap<String, String> {
             }
         };
         s.data = data;
-        s.body = body;
+        s.body_from = body_from;
         s.post = s.path.starts_with("posts/");
         let own = RESERVED
             .iter()
@@ -414,8 +440,8 @@ fn build(input: &SiteInput) -> BTreeMap<String, String> {
             base: &base,
             broken: &mut broken,
         };
-        let md = render_markdown(&s.body, &mut linker);
-        s.html = md.html;
+        let md = render_markdown(s.body(), &mut linker);
+        s.html = Rc::from(md.html.into_boxed_str());
         s.toc = md.toc;
         s.excerpt = md.excerpt;
     }
@@ -507,40 +533,56 @@ fn build(input: &SiteInput) -> BTreeMap<String, String> {
         .iter()
         .map(|s| {
             if s.post {
-                Val::Obj(card_fields(s))
+                Val::obj(card_fields(s))
             } else {
                 Val::Null
             }
         })
         .collect();
-    let site_val = Val::Obj(vec![
-        ("title".to_string(), Val::Str(input.site.title.clone())),
-        ("base_url".to_string(), Val::Str(base.clone())),
+    let site_val = Val::obj(vec![
+        ("title".to_string(), Val::str(site.title)),
+        ("base_url".to_string(), Val::str(base.clone())),
     ]);
-    let tags_val = Val::Arr(
+    let tags_val = Val::arr(
         tags.iter()
             .map(|t| {
-                Val::Obj(vec![
-                    ("name".to_string(), Val::Str(t.name.clone())),
-                    ("slug".to_string(), Val::Str(t.slug.clone())),
-                    ("url".to_string(), Val::Str(t.url.clone())),
+                Val::obj(vec![
+                    ("name".to_string(), Val::str(t.name.clone())),
+                    ("slug".to_string(), Val::str(t.slug.clone())),
+                    ("url".to_string(), Val::str(t.url.clone())),
                     ("count".to_string(), Val::Num(t.posts.len() as i64)),
                 ])
             })
             .collect(),
     );
-    let recent_n = js_to_integer(input.site.recent);
+    let recent_n = js_to_integer(site.recent);
     let recent_n = if recent_n < 0 {
         0
     } else {
         (recent_n as usize).min(post_order.len())
     };
-    let recent_val = Val::Arr(
+    let recent_val = Val::arr(
         post_order[..recent_n]
             .iter()
             .map(|&i| cards[i].clone())
             .collect(),
     );
+
+    // Constant templates: each rendered once per case with the root scope,
+    // at depth 1 — the depth an include of one renders at — so a layout's
+    // depth-0 include of one reads its text instead of rendering it again.
+    let const_info = analyze_templates(&ctx.templates);
+    let mut constant: BTreeMap<String, String> = BTreeMap::new();
+    for (name, is_const) in &const_info {
+        if *is_const {
+            if let Some(html) =
+                render_named(&ctx, &site_val, &tags_val, &recent_val, name, vec![], 1)
+            {
+                constant.insert(name.clone(), html);
+            }
+        }
+    }
+    ctx.constant = constant;
 
     let mut output: BTreeMap<String, String> = BTreeMap::new();
     for s in sources.iter() {
@@ -550,12 +592,13 @@ fn build(input: &SiteInput) -> BTreeMap<String, String> {
             &tags_val,
             &recent_val,
             &s.layout,
-            vec![("page".to_string(), page_val(s, &sources))],
+            vec![("page", page_val(s, &sources))],
+            0,
         ) {
             output.insert(format!("{}/index.html", s.out_dir), html);
         }
     }
-    let per = input.site.per_page;
+    let per = site.per_page;
     let pages = (post_order.len() as f64 / per).ceil().max(1.0);
     let index_url = |k: usize| -> String {
         if k == 1 {
@@ -570,20 +613,20 @@ fn build(input: &SiteInput) -> BTreeMap<String, String> {
         let end = js_to_integer(k as f64 * per);
         let start = (start.max(0) as usize).min(post_order.len());
         let end = (end.max(0) as usize).min(post_order.len());
-        let posts_val = Val::Arr(
+        let posts_val = Val::arr(
             post_order[start..end]
                 .iter()
                 .map(|&i| cards[i].clone())
                 .collect(),
         );
         let total = pages as i64;
-        let pager_val = Val::Obj(vec![
+        let pager_val = Val::obj(vec![
             ("number".to_string(), Val::Num(k as i64)),
             ("total".to_string(), Val::Num(total)),
-            ("url".to_string(), Val::Str(index_url(k))),
+            ("url".to_string(), Val::str(index_url(k))),
             (
                 "newer_url".to_string(),
-                Val::Str(if k == 1 {
+                Val::str(if k == 1 {
                     String::new()
                 } else {
                     index_url(k - 1)
@@ -591,7 +634,7 @@ fn build(input: &SiteInput) -> BTreeMap<String, String> {
             ),
             (
                 "older_url".to_string(),
-                Val::Str(if (k as f64) == pages {
+                Val::str(if (k as f64) == pages {
                     String::new()
                 } else {
                     index_url(k + 1)
@@ -605,9 +648,10 @@ fn build(input: &SiteInput) -> BTreeMap<String, String> {
             &recent_val,
             "index",
             vec![
-                ("posts".to_string(), posts_val),
-                ("pager".to_string(), pager_val),
+                ("posts", posts_val),
+                ("pager", pager_val),
             ],
+            0,
         ) {
             let path = if k == 1 {
                 "index.html".to_string()
@@ -619,14 +663,14 @@ fn build(input: &SiteInput) -> BTreeMap<String, String> {
         k += 1;
     }
     for t in &tags {
-        let tag_val = Val::Obj(vec![
-            ("name".to_string(), Val::Str(t.name.clone())),
-            ("slug".to_string(), Val::Str(t.slug.clone())),
-            ("url".to_string(), Val::Str(t.url.clone())),
+        let tag_val = Val::obj(vec![
+            ("name".to_string(), Val::str(t.name.clone())),
+            ("slug".to_string(), Val::str(t.slug.clone())),
+            ("url".to_string(), Val::str(t.url.clone())),
             ("count".to_string(), Val::Num(t.posts.len() as i64)),
             (
                 "posts".to_string(),
-                Val::Arr(t.posts.iter().map(|&i| cards[i].clone()).collect()),
+                Val::arr(t.posts.iter().map(|&i| cards[i].clone()).collect()),
             ),
         ]);
         if let Some(html) = render_named(
@@ -635,12 +679,13 @@ fn build(input: &SiteInput) -> BTreeMap<String, String> {
             &tags_val,
             &recent_val,
             "tag",
-            vec![("tag".to_string(), tag_val)],
+            vec![("tag", tag_val)],
+            0,
         ) {
             output.insert(format!("tags/{}/index.html", t.slug), html);
         }
     }
-    if let Some(html) = render_named(&ctx, &site_val, &tags_val, &recent_val, "tags", vec![]) {
+    if let Some(html) = render_named(&ctx, &site_val, &tags_val, &recent_val, "tags", vec![], 0) {
         output.insert("tags/index.html".to_string(), html);
     }
     for f in &statics {
@@ -674,27 +719,51 @@ fn build(input: &SiteInput) -> BTreeMap<String, String> {
     output
 }
 
-/// Parse the cases JSON and build every case, returning the answers JSON.
-fn run_all_bytes(input: &[u8]) -> Result<Vec<u8>, String> {
-    let mut bytes = input.to_vec();
-    sanitize_lone_surrogates(&mut bytes);
-    let text = String::from_utf8_lossy(&bytes);
-    let cases: Vec<CaseFile> = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let mut answers: Vec<BTreeMap<String, String>> = Vec::with_capacity(cases.len());
-    for c in &cases {
-        answers.push(build(&c.input));
+/// Whether the raw JSON bytes could hold a lone-surrogate `\uXXXX` escape
+/// (only `\uD800`–`\uDFFF` can be one, so only a `\u` followed by `d`/`D`
+/// matters). The common case has none, and then the input is parsed in
+/// place with no copy at all.
+fn needs_sanitize(input: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 2 < input.len() {
+        if input[i] == b'\\' && input[i + 1] == b'u' && (input[i + 2] == b'd' || input[i + 2] == b'D') {
+            return true;
+        }
+        i += 1;
     }
-    serde_json::to_vec(&answers).map_err(|e| e.to_string())
+    false
 }
 
-/// Parse one site input and build it, returning its answer JSON.
-fn run_one_bytes(input: &[u8]) -> Result<Vec<u8>, String> {
-    let mut bytes = input.to_vec();
-    sanitize_lone_surrogates(&mut bytes);
-    let text = String::from_utf8_lossy(&bytes);
-    let site: SiteInput = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let answer = build(&site);
-    serde_json::to_vec(&answer).map_err(|e| e.to_string())
+/// Parse JSON that may hold lone surrogates: the sanitised copy only when
+/// one can be present, the input slice itself otherwise.
+fn parse_json<T: serde::de::DeserializeOwned>(input: &[u8]) -> Result<T, String> {
+    if needs_sanitize(input) {
+        let mut bytes = input.to_vec();
+        sanitize_lone_surrogates(&mut bytes);
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    } else {
+        serde_json::from_slice(input).map_err(|e| e.to_string())
+    }
+}
+
+/// Parse the cases JSON and build every case, writing the answers JSON into
+/// `out` (no intermediate copies of the input or the output).
+fn run_all_bytes(input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+    let cases: Vec<CaseFile> = parse_json(input)?;
+    let mut answers: Vec<BTreeMap<String, String>> = Vec::with_capacity(cases.len());
+    for c in cases {
+        answers.push(build(c.input));
+    }
+    out.clear();
+    serde_json::to_writer(&mut *out, &answers).map_err(|e| e.to_string())
+}
+
+/// Parse one site input and build it, writing its answer JSON into `out`.
+fn run_one_bytes(input: &[u8], out: &mut Vec<u8>) -> Result<(), String> {
+    let site: SiteInput = parse_json(input)?;
+    let answer = build(site);
+    out.clear();
+    serde_json::to_writer(&mut *out, &answer).map_err(|e| e.to_string())
 }
 
 thread_local! {
@@ -702,12 +771,10 @@ thread_local! {
     static OUT_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::new());
 }
 
-fn finish(res: Result<Vec<u8>, String>) -> u64 {
+fn finish(res: Result<(), String>) -> u64 {
     match res {
-        Ok(out) => OUT_BUF.with(|b| {
-            let mut buf = b.borrow_mut();
-            buf.clear();
-            buf.extend_from_slice(&out);
+        Ok(()) => OUT_BUF.with(|b| {
+            let buf = b.borrow();
             ((buf.len() as u64) << 32) | (buf.as_ptr() as u64)
         }),
         Err(_) => 0,
@@ -729,10 +796,13 @@ pub extern "C" fn wasm_input_ptr(size: usize) -> *mut u8 {
 /// (out_ptr | out_len << 32), or 0 on error.
 #[unsafe(no_mangle)]
 pub extern "C" fn wasm_run_all(len: usize) -> u64 {
-    let res = IN_BUF.with(|b| {
-        let input = b.borrow();
-        let slice = if len <= input.len() { &input[..len] } else { &input[..] };
-        run_all_bytes(slice)
+    let res = IN_BUF.with(|ib| {
+        OUT_BUF.with(|ob| {
+            let input = ib.borrow();
+            let slice = if len <= input.len() { &input[..len] } else { &input[..] };
+            let mut out = ob.borrow_mut();
+            run_all_bytes(slice, &mut out)
+        })
     });
     finish(res)
 }
@@ -741,10 +811,13 @@ pub extern "C" fn wasm_run_all(len: usize) -> u64 {
 /// 32), or 0 on error.
 #[unsafe(no_mangle)]
 pub extern "C" fn wasm_run_one(len: usize) -> u64 {
-    let res = IN_BUF.with(|b| {
-        let input = b.borrow();
-        let slice = if len <= input.len() { &input[..len] } else { &input[..] };
-        run_one_bytes(slice)
+    let res = IN_BUF.with(|ib| {
+        OUT_BUF.with(|ob| {
+            let input = ib.borrow();
+            let slice = if len <= input.len() { &input[..len] } else { &input[..] };
+            let mut out = ob.borrow_mut();
+            run_one_bytes(slice, &mut out)
+        })
     });
     finish(res)
 }

@@ -4,18 +4,36 @@
 
 use crate::util::{is_js_ws, js_json_string, js_num, js_trim, push_escaped};
 use std::collections::BTreeMap;
+use std::rc::Rc;
 
 /// A template value, as templates read it. Objects are field lists; lookup
 /// takes the last field of a name (a later spread or a for's `loop` wins over
 /// an earlier binding of the same name, as in the JavaScript objects).
+///
+/// Strings, arrays and objects ride in `Rc` so cloning a value — which the
+/// build does for the shared site/tags/recent trees on every page render —
+/// is a pointer bump, not a deep copy.
 #[derive(Debug, Clone)]
 pub enum Val {
     Null,
     Bool(bool),
     Num(i64),
-    Str(String),
-    Arr(Vec<Val>),
-    Obj(Vec<(String, Val)>),
+    Str(Rc<str>),
+    Arr(Rc<Vec<Val>>),
+    Obj(Rc<Vec<(String, Val)>>),
+}
+
+impl Val {
+    /// A string value, taking the string's buffer over (no copy).
+    pub fn str(s: String) -> Val {
+        Val::Str(Rc::from(s.into_boxed_str()))
+    }
+    pub fn arr(v: Vec<Val>) -> Val {
+        Val::Arr(Rc::new(v))
+    }
+    pub fn obj(v: Vec<(String, Val)>) -> Val {
+        Val::Obj(Rc::new(v))
+    }
 }
 
 impl Val {
@@ -304,13 +322,17 @@ pub fn parse_template(name: &str, src: &str) -> Result<Vec<Node>, String> {
 /// A scope: the vars bound here, and its parent. Lookup reads a path's first
 /// name from the nearest scope holding it (a for's `loop` before its element),
 /// then each next name as an own property of the value so far.
+///
+/// Vars are a borrowed slice of (`&str`, value) pairs, so a `for` binds its
+/// element and `loop` in a two-entry stack array — no heap allocation per
+/// iteration — and a lookup compares short borrowed names, not owned strings.
 pub struct Scope<'a> {
-    pub vars: Vec<(String, Val)>,
+    pub vars: &'a [(&'a str, Val)],
     pub parent: Option<&'a Scope<'a>>,
 }
 
 impl<'a> Scope<'a> {
-    pub fn root(vars: Vec<(String, Val)>) -> Scope<'a> {
+    pub fn root(vars: &'a [(&'a str, Val)]) -> Scope<'a> {
         Scope { vars, parent: None }
     }
 }
@@ -328,7 +350,7 @@ fn lookup<'a>(scope: &'a Scope<'a>, path: &[String]) -> Lookup<'a> {
     let mut s: Option<&Scope> = Some(scope);
     let mut first: Option<&Val> = None;
     while let Some(sc) = s {
-        if let Some(found) = sc.vars.iter().rev().find(|(k, _)| k == &path[0]) {
+        if let Some(found) = sc.vars.iter().rev().find(|(k, _)| *k == path[0].as_str()) {
             first = Some(&found.1);
             break;
         }
@@ -375,33 +397,39 @@ fn parse_index(name: &str) -> Option<usize> {
     name.parse().ok()
 }
 
-/// A value as text: a string itself, a number in JavaScript's digits, true or
-/// false, an array's items joined by ", ", else "".
-fn text_of(v: &Val) -> String {
+/// A value as text, written straight into `out`: a string itself, a number
+/// in JavaScript's digits, true or false, an array's items joined by ", ",
+/// else "". Writing directly avoids copying a whole page's HTML through an
+/// intermediate string when a template reads it raw.
+fn write_text(out: &mut String, v: &Val, escaped: bool) {
     match v {
-        Val::Str(s) => s.clone(),
-        Val::Num(n) => js_num(*n),
-        Val::Bool(b) => {
-            if *b {
-                "true".to_string()
+        Val::Str(s) => {
+            if escaped {
+                push_escaped(out, s);
             } else {
-                "false".to_string()
+                out.push_str(s);
             }
         }
+        Val::Num(n) => out.push_str(&js_num(*n)),
+        Val::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Val::Arr(items) => {
-            let parts: Vec<String> = items.iter().map(text_of).collect();
-            parts.join(", ")
+            for (i, x) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_text(out, x, escaped);
+            }
         }
-        _ => String::new(),
+        _ => {}
     }
 }
 
-/// A lookup as text.
-fn text_of_lookup(l: &Lookup) -> String {
+/// A lookup as text, written straight into `out`.
+fn write_lookup(out: &mut String, l: &Lookup, escaped: bool) {
     match l {
-        Lookup::Val(v) => text_of(v),
-        Lookup::Num(n) => js_num(*n),
-        Lookup::Missing => String::new(),
+        Lookup::Val(v) => write_text(out, v, escaped),
+        Lookup::Num(n) => out.push_str(&js_num(*n)),
+        Lookup::Missing => {}
     }
 }
 
@@ -429,6 +457,108 @@ fn truthy(v: &Val) -> bool {
 /// Rendering context: the parsed templates and the include depth.
 pub struct Ctx {
     pub templates: BTreeMap<String, Vec<Node>>,
+    /// Templates pre-rendered once per case (see `analyze_templates`): an
+    /// include of one of these at depth 0 reads its text here instead of
+    /// rendering it again. Only filled after the pre-render; empty before.
+    pub constant: BTreeMap<String, String>,
+}
+
+/// The case's constant values, the only roots a constant template may read.
+const CONST_ROOTS: [&str; 3] = ["site", "tags", "recent"];
+
+/// For each parsed template: whether its output depends only on the case's
+/// constant values (`site`, `tags`, `recent`) — so one render per case serves
+/// every page that includes it. A template is constant when every path in its
+/// inlined tree, read with an empty scope stack, names a constant root or a
+/// name its own `for`s bind. It also needs no `for` anywhere in the case to
+/// bind a constant root (a loop over `site` would shadow it in a caller),
+/// and a template whose includes cycle is never constant. The check is
+/// conservative: a template it calls constant really is one.
+pub fn analyze_templates(templates: &BTreeMap<String, Vec<Node>>) -> BTreeMap<String, bool> {
+    // Every name any `for` binds, anywhere in the case.
+    fn collect_for_names(nodes: &[Node], out: &mut std::collections::BTreeSet<String>) {
+        for n in nodes {
+            match n {
+                Node::For { name, body, .. } => {
+                    out.insert(name.clone());
+                    collect_for_names(body, out);
+                }
+                Node::If { then, els, .. } => {
+                    collect_for_names(then, out);
+                    if let Some(e) = els {
+                        collect_for_names(e, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut bound_anywhere = std::collections::BTreeSet::new();
+    for nodes in templates.values() {
+        collect_for_names(nodes, &mut bound_anywhere);
+    }
+    let roots_free = CONST_ROOTS.iter().all(|r| !bound_anywhere.contains(*r));
+
+    fn walk(
+        nodes: &[Node],
+        templates: &BTreeMap<String, Vec<Node>>,
+        stack: &mut Vec<String>,
+        seen: &mut std::collections::BTreeSet<String>,
+        constant: &mut bool,
+    ) {
+        for n in nodes {
+            match n {
+                Node::For { name, path, body } => {
+                    if !(CONST_ROOTS.contains(&path[0].as_str()) || stack.contains(&path[0])) {
+                        *constant = false;
+                    }
+                    stack.push(name.clone());
+                    stack.push("loop".to_string());
+                    walk(body, templates, stack, seen, constant);
+                    stack.pop();
+                    stack.pop();
+                }
+                Node::If { path, then, els, .. } => {
+                    if !(CONST_ROOTS.contains(&path[0].as_str()) || stack.contains(&path[0])) {
+                        *constant = false;
+                    }
+                    walk(then, templates, stack, seen, constant);
+                    if let Some(e) = els {
+                        walk(e, templates, stack, seen, constant);
+                    }
+                }
+                Node::Var(path) | Node::Raw(path) => {
+                    if !(CONST_ROOTS.contains(&path[0].as_str()) || stack.contains(&path[0])) {
+                        *constant = false;
+                    }
+                }
+                Node::Include(name) => {
+                    let Some(target) = templates.get(name) else {
+                        continue;
+                    };
+                    if seen.contains(name) {
+                        *constant = false;
+                        continue;
+                    }
+                    seen.insert(name.clone());
+                    walk(target, templates, stack, seen, constant);
+                    seen.remove(name);
+                }
+                Node::Text(_) => {}
+            }
+        }
+    }
+
+    let mut info = BTreeMap::new();
+    for (name, nodes) in templates {
+        let mut constant = roots_free;
+        let mut stack: Vec<String> = Vec::new();
+        let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        seen.insert(name.clone());
+        walk(nodes, templates, &mut stack, &mut seen, &mut constant);
+        info.insert(name.clone(), constant);
+    }
+    info
 }
 
 /// `nodes` rendered in `scope`, appended to `out`.
@@ -438,11 +568,11 @@ pub fn render_nodes(nodes: &[Node], scope: &Scope, ctx: &Ctx, depth: usize, out:
             Node::Text(t) => out.push_str(t),
             Node::Var(p) => {
                 let v = lookup(scope, p);
-                push_escaped(out, &text_of_lookup(&v));
+                write_lookup(out, &v, true);
             }
             Node::Raw(p) => {
                 let v = lookup(scope, p);
-                out.push_str(&text_of_lookup(&v));
+                write_lookup(out, &v, false);
             }
             Node::If { not, path, then, els } => {
                 let v = truthy_lookup(&lookup(scope, path));
@@ -455,7 +585,7 @@ pub fn render_nodes(nodes: &[Node], scope: &Scope, ctx: &Ctx, depth: usize, out:
                 if let Lookup::Val(Val::Arr(items)) = lookup(scope, path) {
                     let len = items.len();
                     for (k, x) in items.iter().enumerate() {
-                        let loop_val = Val::Obj(vec![
+                        let loop_val = Val::obj(vec![
                             ("index".to_string(), Val::Num(k as i64 + 1)),
                             ("first".to_string(), Val::Bool(k == 0)),
                             ("last".to_string(), Val::Bool(k + 1 == len)),
@@ -463,16 +593,27 @@ pub fn render_nodes(nodes: &[Node], scope: &Scope, ctx: &Ctx, depth: usize, out:
                         ]);
                         // The element is bound first and `loop` after it, so
                         // a for named `loop` reads the loop object, as the
-                        // JavaScript object literal does.
-                        let child = Scope {
-                            vars: vec![(name.clone(), x.clone()), ("loop".to_string(), loop_val)],
-                            parent: Some(scope),
-                        };
+                        // JavaScript object literal does. The two bindings
+                        // live in a stack array, not a fresh heap vector.
+                        let child_vars: [(&str, Val); 2] =
+                            [(name.as_str(), x.clone()), ("loop", loop_val)];
+                        let child = Scope { vars: &child_vars, parent: Some(scope) };
                         render_nodes(body, &child, ctx, depth, out);
                     }
                 }
             }
             Node::Include(name) => {
+                // At depth 0 — the depth a layout's includes run at, and the
+                // depth the pre-render ran at — a constant template's text is
+                // read from the pre-render instead of rendered again. Deeper,
+                // the pre-render's depth limit would decide differently, so
+                // the template renders fresh there.
+                if depth == 0 {
+                    if let Some(text) = ctx.constant.get(name) {
+                        out.push_str(text);
+                        continue;
+                    }
+                }
                 if depth < 8 {
                     if let Some(t) = ctx.templates.get(name) {
                         render_nodes(t, scope, ctx, depth + 1, out);

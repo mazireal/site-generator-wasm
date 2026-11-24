@@ -11,6 +11,10 @@ use unicode_normalization::UnicodeNormalization;
 /// bytes (code points), which differs from UTF-16 order for characters above
 /// the BMP versus U+E000..U+FFFF.
 pub fn cmp_u16(a: &str, b: &str) -> Ordering {
+    // ASCII bytes order exactly like their UTF-16 code units.
+    if a.is_ascii() && b.is_ascii() {
+        return a.cmp(b);
+    }
     a.encode_utf16().cmp(b.encode_utf16())
 }
 
@@ -53,16 +57,33 @@ pub fn is_escapable(c: char) -> bool {
 }
 
 /// Append `text` to `out` with & < > " ' escaped (text.js escapeHtml).
+/// Maximal runs of bytes needing no escape are copied at once (the escapable
+/// bytes are all ASCII, so a run never splits a multi-byte character).
 pub fn push_escaped(out: &mut String, text: &str) {
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
+    let b = text.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let mut j = i;
+        while j < b.len() {
+            match b[j] {
+                b'&' | b'<' | b'>' | b'"' | b'\'' => break,
+                _ => j += 1,
+            }
         }
+        if j > i {
+            out.push_str(&text[i..j]);
+        }
+        if j < b.len() {
+            out.push_str(match b[j] {
+                b'&' => "&amp;",
+                b'<' => "&lt;",
+                b'>' => "&gt;",
+                b'"' => "&quot;",
+                _ => "&#39;",
+            });
+            j += 1;
+        }
+        i = j;
     }
 }
 
@@ -85,7 +106,8 @@ pub fn escape_char(c: char) -> &'static str {
 pub fn slugify(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut gap = false;
-    for ch in text.nfkd().filter(|c| !c.is_mark()) {
+    // The step a character takes through the slug rule.
+    let step = |ch: char, out: &mut String, gap: &mut bool| {
         let keep = if ch.is_ascii_uppercase() {
             Some(ch.to_ascii_lowercase())
         } else if ch.is_ascii_lowercase() || ch.is_ascii_digit() {
@@ -95,15 +117,25 @@ pub fn slugify(text: &str) -> String {
         };
         match keep {
             Some(k) => {
-                if gap {
+                if *gap {
                     out.push('-');
                 }
-                gap = false;
+                *gap = false;
                 out.push(k);
             }
             None => {
-                gap = !out.is_empty();
+                *gap = !out.is_empty();
             }
+        }
+    };
+    if text.is_ascii() {
+        // NFKD is the identity on ASCII, and no ASCII character is a mark.
+        for ch in text.chars() {
+            step(ch, &mut out, &mut gap);
+        }
+    } else {
+        for ch in text.nfkd().filter(|c| !c.is_mark()) {
+            step(ch, &mut out, &mut gap);
         }
     }
     if out.len() > 64 {
@@ -154,16 +186,32 @@ pub fn long_date(date: &str) -> String {
 }
 
 /// The words of a body: its runs of characters other than (JavaScript)
-/// whitespace (index.js wordsOf).
+/// whitespace (index.js wordsOf). ASCII bytes decide directly; only a
+/// multi-byte character needs decoding to test for whitespace.
 pub fn words_of(text: &str) -> usize {
+    let b = text.as_bytes();
     let mut n = 0;
     let mut in_word = false;
-    for c in text.chars() {
-        if is_js_ws(c) {
-            in_word = false;
-        } else if !in_word {
-            in_word = true;
-            n += 1;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c < 0x80 {
+            if matches!(c, 9 | 10 | 11 | 12 | 13 | 32) {
+                in_word = false;
+            } else if !in_word {
+                in_word = true;
+                n += 1;
+            }
+            i += 1;
+        } else {
+            let ch = text[i..].chars().next().unwrap();
+            if is_js_ws(ch) {
+                in_word = false;
+            } else if !in_word {
+                in_word = true;
+                n += 1;
+            }
+            i += ch.len_utf8();
         }
     }
     n

@@ -170,9 +170,11 @@ fn value_of(key: &str, raw: &str, data: &mut FmData) -> Result<(), String> {
     }
 }
 
-/// A source's front matter and body: (data, body), or the first reason it is
-/// refused. `text` has "\n" line ends.
-pub fn parse_front_matter(text: &str) -> Result<(FmData, String), String> {
+/// A source's front matter and the byte offset its body starts at: (data,
+/// body_start), or the first reason it is refused. `text` has "\n" line ends.
+/// The body is the slice `text[body_start..]` — the lines after the closing
+/// `---`, joined by "\n" — so no copy of the body is made here.
+pub fn parse_front_matter(text: &str) -> Result<(FmData, usize), String> {
     let lines: Vec<&str> = text.split('\n').collect();
     if lines.is_empty() || lines[0] != "---" {
         return Err("no front matter".to_string());
@@ -228,5 +230,11 @@ pub fn parse_front_matter(text: &str) -> Result<(FmData, String), String> {
     if !seen.contains(&"title") {
         return Err("no title".to_string());
     }
-    Ok((data, lines[close + 1..].join("\n")))
+    // The body starts just after the closing line's line end (or at the end
+    // of the text when the closing line is the last one without one).
+    let mut body_start = 0;
+    for l in &lines[..=close] {
+        body_start += l.len() + 1;
+    }
+    Ok((data, body_start.min(text.len())))
 }

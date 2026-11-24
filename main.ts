@@ -18,6 +18,21 @@ import { setFlagsFromString } from 'node:v8';
 // V8's incremental marking off, set before solve.js is imported so all of its
 // work runs under it.
 setFlagsFromString('--no-incremental-marking');
+// The tiering budget counts wasm bytes executed before a function is handed
+// to TurboFan. A timed heat runs this program once per fresh process, so a
+// function tiered up mid-run pays TurboFan's background compilation in CPU
+// time the heat counts, and never runs again to repay it: raising the budget
+// past anything one run executes keeps every function on Liftoff, whose
+// whole first call costs less than the compile it would have triggered.
+setFlagsFromString('--wasm-tiering-budget=1000000000');
+// --no-opt skips the optimizing compiler for this driver's little JavaScript
+// (a single cold pass: its compile cost and deopts cost more than its code
+// saves), --no-lazy compiles it eagerly, and --max-semi-space-size=8 keeps
+// the young generation small, so the garbage a run leaves is collected in
+// cheap scavenges.
+setFlagsFromString('--no-opt');
+setFlagsFromString('--no-lazy');
+setFlagsFromString('--max-semi-space-size=8');
 
 /** solve.js, imported by its URL (a .js module carries no types) and typed by its contract. */
 const { runAll } = (await import(new URL('./solve.js', import.meta.url).href)) as {
