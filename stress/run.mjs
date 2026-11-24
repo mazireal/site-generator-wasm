@@ -18,7 +18,22 @@ const KIT = '/home/hatch/workspace/makefun/site-generator-speed-01-run-20261122-
 const ours = await import(join(HERE, '..', 'solve.js'));
 const base = await import(join(KIT, 'baselines', 'makefun-site', 'solve.js'));
 
-const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const eq = (a, b) => {
+  // Deep equality the way the scorer compares answers: strings code unit for
+  // code unit, arrays in order, objects with the same keys in any order.
+  // (JSON.stringify would be order-sensitive, and the WASM entry returns its
+  // object keys sorted, unlike the baseline's insertion order.)
+  if (a === b) return true;
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    if (a.length !== b.length) return false;
+    return a.every((x, i) => eq(x, b[i]));
+  }
+  const ka = Object.keys(a), kb = Object.keys(b);
+  if (ka.length !== kb.length) return false;
+  return ka.every((k) => Object.hasOwn(b, k) && eq(a[k], b[k]));
+};
 let pass = 0;
 let fail = 0;
 function check(label, input) {
